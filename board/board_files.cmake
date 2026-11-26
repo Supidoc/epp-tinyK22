@@ -1,0 +1,11 @@
+add_executable(
+  SOURCES 
+        board.c
+        board.h
+        clock_config.c
+        clock_config.h
+        peripherals.c
+        peripherals.h
+        pin_mux.c
+        pin_mux.h
+)

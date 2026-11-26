@@ -1,0 +1,59 @@
+{
+  "version": 7,
+  "cmakeMinimumRequired": {
+    "major": 3
+  },
+  "configurePresets": [
+    {
+      "name": "debug",
+      "displayName": "debug",
+      "generator": "Ninja",
+      "binaryDir": "${fileDir}/build/debug",
+      "toolchainFile": "$env{MCUXPRESSO_SDK_PATH}/tools/cmake_toolchain_files/armgcc.cmake",
+      "inherits": "debug-env",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "debug",
+        "LANGUAGE": "C",
+        "SdkRootDirPath": "$env{MCUXPRESSO_SDK_PATH}",
+        "CMAKE_RUNTIME_OUTPUT_DIRECTORY": "$env{binaryDir}",
+        "CMAKE_LIBRARY_OUTPUT_DIRECTORY": "$env{binaryDir}",
+        "CMAKE_ARCHIVE_OUTPUT_DIRECTORY": "$env{binaryDir}",
+        "DEBUG_CONSOLE": "UART",
+        "LIBRARY_TYPE": "NEWLIB"
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "release",
+      "generator": "Ninja",
+      "binaryDir": "${fileDir}/build/${presetName}",
+      "toolchainFile": "$env{MCUXPRESSO_SDK_PATH}tools/cmake_toolchain_files/armgcc.cmake",
+      "inherits": "release-env",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "release",
+        "LANGUAGE": "C",
+        "SdkRootDirPath": "$env{MCUXPRESSO_SDK_PATH}",
+        "CMAKE_RUNTIME_OUTPUT_DIRECTORY": "$env{binaryDir}",
+        "CMAKE_LIBRARY_OUTPUT_DIRECTORY": "$env{binaryDir}",
+        "CMAKE_ARCHIVE_OUTPUT_DIRECTORY": "$env{binaryDir}",
+        "DEBUG_CONSOLE": "UART",
+        "LIBRARY_TYPE": "NEWLIB"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "debug",
+      "displayName": "debug",
+      "configurePreset": "debug"
+    },
+    {
+      "name": "release",
+      "displayName": "release",
+      "configurePreset": "release"
+    }
+  ],
+  "include": [
+    "mcux_include.json"
+  ]
+}

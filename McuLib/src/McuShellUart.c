@@ -1,0 +1,951 @@
+/*!
+ * Copyright (c) 2020-2024, Erich Styger
+ *
+ * SPDX-License-Identifier: BSD-3-Clause
+ * \file
+ * \brief \brief Implementation of the McuShellUart module.
+ */
+
+#include "McuShellUartconfig.h"
+#if McuShellUart_CONFIG_IS_ENABLED && McuShellUart_CONFIG_UART!=McuShellUart_CONFIG_UART_NONE
+#include "McuShellUart.h"
+#include "McuShell.h"
+#include "McuUtility.h"
+#if McuShellUart_CONFIG_USE_FREERTOS
+  #include "McuRTOS.h"
+#else
+  #include "McuRB.h"
+#endif
+#if McuLib_CONFIG_CPU_IS_RPxxxx
+  #include "hardware/uart.h"
+  #include "hardware/irq.h"
+  #include "hardware/gpio.h"
+#endif
+#if McuLib_CONFIG_CPU_IS_ESP32
+  #include "driver/uart.h"
+  #include "driver/gpio.h"
+#endif
+#include "McuLog.h"
+
+#if McuShellUart_CONFIG_USE_FREERTOS
+  static QueueHandle_t uartRxQueue;
+#else
+  static McuRB_Handle_t rxRingBuffer;
+#endif
+
+/*********************************************************************************************************/
+/* Shell interface */
+/*********************************************************************************************************/
+static void McuShellUart_SendChar(unsigned char ch) {
+  McuShellUart_CONFIG_UART_WRITE_BLOCKING(McuShellUart_CONFIG_UART_DEVICE, &ch, 1);
+}
+
+#if McuLib_CONFIG_CPU_IS_ESP32
+static void EspUart_ReadChar(uint8_t *c) {
+  unsigned char ch;
+  int len = 0;
+
+ // if (xSemaphoreTakeRecursive(SHELL_stdioMutex, portMAX_DELAY)==pdPASS) { /* take mutex */
+    len = uart_read_bytes(McuShellUart_CONFIG_UART_DEVICE, &ch, 1, 0);
+ //   (void)xSemaphoreGiveRecursive(SHELL_stdioMutex); /* give back mutex */
+ // }
+  if (len==0) {
+    *c = '\0';
+  } else {
+    *c = ch;
+  }
+}
+#endif /* McuLib_CONFIG_CPU_IS_ESP32 */
+
+static void McuShellUart_ReadChar(uint8_t *c) {
+#if McuShellUart_CONFIG_USE_FREERTOS
+  #if McuLib_CONFIG_CPU_IS_ESP32
+    EspUart_ReadChar(c);
+  #else
+    uint8_t ch;
+    if (xQueueReceive(uartRxQueue, &ch, 0)==pdPASS ) {
+      *c = ch; /* return received character */
+    } else {
+      *c = '\0'; /* nothing received */
+    }
+  #endif
+#else
+  uint8_t ch;
+  if (McuRB_Get(rxRingBuffer, &ch)!=ERR_OK) {
+    *c = '\0'; /* nothing received */
+  } else {
+    *c = ch; /* return received character */
+  }
+#endif
+}
+
+#if McuLib_CONFIG_CPU_IS_ESP32
+static bool EspUart_CharPresent(void) {
+  size_t size=0;
+
+ // if (xSemaphoreTakeRecursive(SHELL_stdioMutex, portMAX_DELAY)==pdPASS) { /* take mutex */
+    uart_get_buffered_data_len(McuShellUart_CONFIG_UART_DEVICE, &size);
+   // (void)xSemaphoreGiveRecursive(SHELL_stdioMutex); /* give back mutex */
+ // }
+  return size!=0;
+}
+#endif /* McuLib_CONFIG_CPU_IS_ESP32 */
+
+static bool McuShellUart_CharPresent(void) {
+#if McuShellUart_CONFIG_USE_FREERTOS
+  #if McuLib_CONFIG_CPU_IS_ESP32
+    return EspUart_CharPresent();
+  #else
+  return uxQueueMessagesWaiting(uartRxQueue)!=0;
+  #endif
+#else
+  return McuRB_NofElements(rxRingBuffer)!=0;
+#endif
+}
+
+#if McuShell_CONFIG_HAS_WRITE_DATA
+int McuShellUart_WriteData(const void *data, size_t size) {
+  (void)McuShellUart_CONFIG_UART_WRITE_BLOCKING(McuShellUart_CONFIG_UART_DEVICE, data, size);
+  return size;
+}
+#endif
+
+McuShell_ConstStdIOType McuShellUart_stdio = {
+    .stdIn = (McuShell_StdIO_In_FctType)McuShellUart_ReadChar,
+    .stdOut = (McuShell_StdIO_OutErr_FctType)McuShellUart_SendChar,
+    .stdErr = (McuShell_StdIO_OutErr_FctType)McuShellUart_SendChar,
+    .keyPressed = McuShellUart_CharPresent, /* if input is not empty */
+  #if McuShell_CONFIG_ECHO_ENABLED
+    .echoEnabled = McuShellUart_CONFIG_ECHO_ENABLED,
+  #endif
+  #if McuShell_CONFIG_HAS_WRITE_DATA
+    .writeData = McuShellUart_WriteData,
+  #endif
+};
+
+McuShell_ConstStdIOTypePtr McuShellUart_GetStdio(void) {
+  return &McuShellUart_stdio;
+}
+
+uint8_t McuShellUart_DefaultShellBuffer[McuShell_DEFAULT_SHELL_BUFFER_SIZE]; /* default buffer which can be used by the application */
+/*********************************************************************************************************/
+
+#if McuLib_CONFIG_CPU_IS_RPxxxx
+  /* nothing needed */
+#elif McuLib_CONFIG_CPU_IS_ESP32
+  /* nothing needed */
+#else
+void McuShellUart_CONFIG_UART_IRQ_HANDLER(void) {
+  uint8_t data;
+  uint32_t flags;
+#if McuShellUart_CONFIG_USE_FREERTOS
+  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+#endif
+  uint8_t count;
+
+  flags = McuShellUart_CONFIG_UART_GET_FLAGS(McuShellUart_CONFIG_UART_DEVICE);
+#if McuShellUart_CONFIG_HAS_FIFO
+  if (flags&kUART_RxFifoOverflowFlag) {
+    count = 0; /* statement to allow debugger to set a breakpoint here */
+  }
+#endif
+  /* If new data arrived. */
+  if (flags&McuShellUart_CONFIG_UART_HW_RX_READY_FLAGS) {
+  #if McuShellUart_CONFIG_HAS_FIFO
+    count = McuShellUart_CONFIG_UART_DEVICE->RCFIFO;
+  #else
+    count = 1;
+  #endif
+    while(count!=0) {
+      data = McuShellUart_CONFIG_UART_READ_BYTE(McuShellUart_CONFIG_UART_DEVICE);
+  #if McuShellUart_CONFIG_USE_FREERTOS
+      if (uartRxQueue!=NULL) {
+        (void)xQueueSendFromISR(uartRxQueue, &data, &xHigherPriorityTaskWoken);
+      }
+  #else
+      McuRB_Put(rxRingBuffer, &data);
+  #endif
+      count--;
+    }
+  }
+  McuShellUART_CONFIG_CLEAR_STATUS_FLAGS(McuShellUart_CONFIG_UART_DEVICE, flags|McuShellUART_CONFIG_CLEAR_EXTRA_STATUS_FLAGS);
+#if McuShellUart_CONFIG_USE_FREERTOS
+  if (xHigherPriorityTaskWoken != pdFALSE) {
+    vPortYieldFromISR();
+  }
+#endif
+#if McuLib_CONFIG_CPU_IS_ARM_CORTEX_M && ((McuLib_CONFIG_CORTEX_M==4) || (McuLib_CONFIG_CORTEX_M==7))
+  /* ARM errata 838869, affects Cortex-M4, Cortex-M4F Store immediate overlapping exception return operation might vector to incorrect interrupt.
+  * For Cortex-M7, if core speed much faster than peripheral register write speed, the peripheral interrupt flags may be still set after exiting ISR, this results to
+  * the same error similar with errata 83869. */
+  __DSB();
+#endif
+}
+#endif
+
+void McuShellUart_DeMuxUartPins(int uart) {
+    switch(uart) {
+#if McuLib_CONFIG_CPU_VARIANT==McuLib_CONFIG_CPU_VARIANT_NXP_K22FN
+    case McuShellUart_CONFIG_UART_K22FN512_LPUART0_C3_C4: /* PTC3, PTC4 */
+       /* PORTC3 (pin 46) is configured to default muxing */
+      PORT_SetPinMux(PORTC, 3U, kPORT_MuxAlt0);
+      /* PORTC4 (pin 49) is configured to default muxing */
+      PORT_SetPinMux(PORTC, 4U, kPORT_MuxAlt0);
+      break;
+
+    case McuShellUart_CONFIG_UART_K22FN512_UART0_A1_A2: /* PTA1, PTA2 */
+      /* PORTA1 (pin 35) is configured to default muxing */
+      PORT_SetPinMux(PORTA, 1, kPORT_MuxAlt0);
+      /* PORTA2 (pin 36) is configured to default muxing */
+      PORT_SetPinMux(PORTA, 2, kPORT_MuxAlt0);
+      break;
+
+    case McuShellUart_CONFIG_UART_K22FN512_UART0_B16_B17: /* PTB16, PTB17 */
+      /* PORTB16 (pin 39) is configured to default muxing */
+      PORT_SetPinMux(PORTB, 16, kPORT_MuxAlt0);
+      /* PORTB17 (pin 40) is configured to default muxing */
+      PORT_SetPinMux(PORTB, 17, kPORT_MuxAlt0);
+      break;
+
+    case McuShellUart_CONFIG_UART_K22FN512_UART1_E1_E0:
+
+      /* PORTE0 (pin 1) is configured to default muxing */
+      PORT_SetPinMux(PORTE, 0U, kPORT_MuxAlt0);
+      /* PORTE1 (pin 2) is configured to default muxing */
+      PORT_SetPinMux(PORTE, 1U, kPORT_MuxAlt0);
+      break;
+
+    case McuShellUart_CONFIG_UART_K22FN512_UART2_D2_D3:
+      /* PORTD2 (pin 59) is configured to default muxing */
+      PORT_SetPinMux(PORTD, 2U, kPORT_MuxAlt0);
+      /* PORTD3 (pin 60) is configured to default muxing */
+      PORT_SetPinMux(PORTD, 3U, kPORT_MuxAlt0);
+      break;
+#elif McuLib_CONFIG_CPU_VARIANT==McuLib_CONFIG_CPU_VARIANT_NXP_K22FX
+    case McuShellUart_CONFIG_UART_K22FX512_UART0_A1_A2:
+      /* PORTA1 (pin 27) is configured as UART0_RX */
+      PORT_SetPinMux(PORTA, 1U, kPORT_MuxAlt2);
+      /* PORTA2 (pin 28) is configured as UART0_TX */
+      PORT_SetPinMux(PORTA, 2U, kPORT_MuxAlt2);
+      break;
+
+    case McuShellUart_CONFIG_UART_K22FX512_UART1_E1_E0:
+      /* PORTE0 (pin 1) is configured as UART1_TX */
+      PORT_SetPinMux(PORTE, 0U, kPORT_MuxAlt3);
+       /* PORTE1 (pin 2) is configured as UART1_RX */
+      PORT_SetPinMux(PORTE, 1U, kPORT_MuxAlt3);
+      break;
+#elif McuShellUart_CONFIG_UART==McuShellUart_CONFIG_UART_K64FN1M_UART0_B16_B17
+    case McuShellUart_CONFIG_UART_K64FN1M_UART0_B16_B17:
+      /* UART0 Rx and Tx */
+      /* PORTB16 (pin 62) is configured as UART0_RX */
+      PORT_SetPinMux(PORTB, 16U, kPORT_MuxAlt3);
+      /* PORTB17 (pin 63) is configured as UART0_TX */
+      PORT_SetPinMux(PORTB, 1U, kPORT_MuxAlt3);
+       break;
+#elif McuLib_CONFIG_CPU_IS_RPxxxx
+    // case McuShellUart_CONFIG_UART_RP2040_UART1_GPIO4_GPIO5:
+    //   gpio_set_function(McuShellUart_CONFIG_UART_TX_PIN, GPIO_FUNC_UART);
+    //   gpio_set_function(McuShellUart_CONFIG_UART_RX_PIN, GPIO_FUNC_UART);
+    //   break;
+#elif McuLib_CONFIG_CPU_IS_MCXN
+    case McuShellUart_CONFIG_UART_MCXN947_FC4_P1_8_P1_9:
+        // /* Enables the clock for PORT1: Enables clock */
+        // CLOCK_EnableClock(kCLOCK_Port1);
+
+        // /* EFT detect interrupts configuration on PORT1_ */
+        // PORT_DisableEFTDetectInterrupts(PORT1, 0x0300u);
+
+        // const port_pin_config_t port1_8_pinA1_config = {/* Internal pull-up/down resistor is disabled */
+        //                                                 .pullSelect = kPORT_PullDisable,
+        //                                                 /* Low internal pull resistor value is selected. */
+        //                                                 .pullValueSelect = kPORT_LowPullResistor,
+        //                                                 /* Fast slew rate is configured */
+        //                                                 .slewRate = kPORT_FastSlewRate,
+        //                                                 /* Passive input filter is disabled */
+        //                                                 .passiveFilterEnable = kPORT_PassiveFilterDisable,
+        //                                                 /* Open drain output is disabled */
+        //                                                 .openDrainEnable = kPORT_OpenDrainDisable,
+        //                                                 /* Low drive strength is configured */
+        //                                                 .driveStrength = kPORT_LowDriveStrength,
+        //                                                 /* Pin is configured as FC4_P0 */
+        //                                                 .mux = kPORT_MuxAlt2,
+        //                                                 /* Digital input enabled */
+        //                                                 .inputBuffer = kPORT_InputBufferEnable,
+        //                                                 /* Digital input is not inverted */
+        //                                                 .invertInput = kPORT_InputNormal,
+        //                                                 /* Pin Control Register fields [15:0] are not locked */
+        //                                                 .lockRegister = kPORT_UnlockRegister};
+        // /* PORT1_8 (pin A1) is configured as FC4_P0 */
+        // PORT_SetPinConfig(PORT1, 8U, &port1_8_pinA1_config);
+
+        // const port_pin_config_t port1_9_pinB1_config = {/* Internal pull-up/down resistor is disabled */
+        //                                                 .pullSelect = kPORT_PullDisable,
+        //                                                 /* Low internal pull resistor value is selected. */
+        //                                                 .pullValueSelect = kPORT_LowPullResistor,
+        //                                                 /* Fast slew rate is configured */
+        //                                                 .slewRate = kPORT_FastSlewRate,
+        //                                                 /* Passive input filter is disabled */
+        //                                                 .passiveFilterEnable = kPORT_PassiveFilterDisable,
+        //                                                 /* Open drain output is disabled */
+        //                                                 .openDrainEnable = kPORT_OpenDrainDisable,
+        //                                                 /* Low drive strength is configured */
+        //                                                 .driveStrength = kPORT_LowDriveStrength,
+        //                                                 /* Pin is configured as FC4_P1 */
+        //                                                 .mux = kPORT_MuxAlt2,
+        //                                                 /* Digital input enabled */
+        //                                                 .inputBuffer = kPORT_InputBufferEnable,
+        //                                                 /* Digital input is not inverted */
+        //                                                 .invertInput = kPORT_InputNormal,
+        //                                                 /* Pin Control Register fields [15:0] are not locked */
+        //                                                 .lockRegister = kPORT_UnlockRegister};
+        // /* PORT1_9 (pin B1) is configured as FC4_P1 */
+        // PORT_SetPinConfig(PORT1, 9U, &port1_9_pinB1_config);
+        // break;
+#endif /* McuLib_CONFIG_CPU_VARIANT_NXP_K22FN */
+    default:
+      McuLog_fatal("Unknown UART configuration!");
+      for(;;) { /* error */ }
+  } /* switch */
+}
+
+void McuShellUart_MuxUartPins(int uart) {
+  switch(uart) {
+#if McuLib_CONFIG_CPU_VARIANT==McuLib_CONFIG_CPU_VARIANT_NXP_K22FN
+    case McuShellUart_CONFIG_UART_K22FN512_LPUART0_C3_C4: /* PTC3, PTC4 */
+      CLOCK_EnableClock(kCLOCK_PortC);
+
+      /* PORTC3 (pin 46) is configured as LPUART0_RX */
+      PORT_SetPinMux(PORTC, 3U, kPORT_MuxAlt7);
+      PORTC->PCR[3] = ((PORTC->PCR[3] &
+                        /* Mask bits to zero which are setting */
+                        (~(PORT_PCR_PS_MASK | PORT_PCR_PE_MASK | PORT_PCR_ISF_MASK)))
+                       /* Pull Select: Internal pullup resistor is enabled on the corresponding pin, if the
+                        * corresponding PE field is set. */
+                       | (uint32_t)(kPORT_PullUp));
+
+      /* PORTC4 (pin 49) is configured as LPUART0_TX */
+      PORT_SetPinMux(PORTC, 4U, kPORT_MuxAlt7);
+      PORTC->PCR[4] = ((PORTC->PCR[4] &
+                        /* Mask bits to zero which are setting */
+                        (~(PORT_PCR_PS_MASK | PORT_PCR_PE_MASK | PORT_PCR_ISF_MASK)))
+                       /* Pull Select: Internal pullup resistor is enabled on the corresponding pin, if the
+                        * corresponding PE field is set. */
+                       | (uint32_t)(kPORT_PullUp));
+      break;
+
+    case McuShellUart_CONFIG_UART_K22FN512_UART0_A1_A2: /* PTA1, PTA2 */
+      CLOCK_EnableClock(kCLOCK_PortA);
+
+    /* PORTA1 (pin 35) is configured as UART0_RX */
+      PORT_SetPinMux(PORTA, 1, kPORT_MuxAlt2);
+      PORTA->PCR[1] = ((PORTA->PCR[1] &
+                        /* Mask bits to zero which are setting */
+                        (~(PORT_PCR_PS_MASK | PORT_PCR_PE_MASK | PORT_PCR_ISF_MASK)))
+                       /* Pull Select: Internal pullup resistor is enabled on the corresponding pin, if the
+                        * corresponding PE field is set. */
+                       | (uint32_t)(kPORT_PullUp));
+
+      /* PORTA2 (pin 36) is configured as UART0_TX */
+      PORT_SetPinMux(PORTA, 2, kPORT_MuxAlt2);
+      PORTA->PCR[2] = ((PORTA->PCR[2] &
+                        /* Mask bits to zero which are setting */
+                        (~(PORT_PCR_PS_MASK | PORT_PCR_PE_MASK | PORT_PCR_ISF_MASK)))
+                       /* Pull Select: Internal pullup resistor is enabled on the corresponding pin, if the
+                        * corresponding PE field is set. */
+                       | (uint32_t)(kPORT_PullUp));
+
+      #define SOPT5_UART0TXSRC_UART_TX 0x00u /*!<@brief UART 0 transmit data source select: UART0_TX pin */
+      SIM->SOPT5 = ((SIM->SOPT5 &
+                /* Mask bits to zero which are setting */
+                (~(SIM_SOPT5_UART0TXSRC_MASK)))
+              /* UART 0 transmit data source select: UART0_TX pin. */
+              | SIM_SOPT5_UART0TXSRC(SOPT5_UART0TXSRC_UART_TX));
+      break;
+
+    case McuShellUart_CONFIG_UART_K22FN512_UART0_B16_B17: /* PTB16, PTB17 */
+      CLOCK_EnableClock(kCLOCK_PortB);
+
+      /* PORTB16 (pin 39) is configured as UART0_RX */
+      PORT_SetPinMux(PORTB, 16, kPORT_MuxAlt3);
+      PORTB->PCR[16] = ((PORTB->PCR[16] &
+                         /* Mask bits to zero which are setting */
+                         (~(PORT_PCR_PS_MASK | PORT_PCR_PE_MASK | PORT_PCR_ISF_MASK)))
+                        /* Pull Select: Internal pullup resistor is enabled on the corresponding pin, if the
+                         * corresponding PE field is set. */
+                        | (uint32_t)(kPORT_PullUp));
+
+
+      /* PORTB17 (pin 40) is configured as UART0_TX */
+      PORT_SetPinMux(PORTB, 17, kPORT_MuxAlt3);
+      PORTB->PCR[17] = ((PORTB->PCR[17] &
+                          /* Mask bits to zero which are setting */
+                          (~(PORT_PCR_PS_MASK | PORT_PCR_PE_MASK | PORT_PCR_ISF_MASK)))
+                         /* Pull Select: Internal pullup resistor is enabled on the corresponding pin, if the
+                          * corresponding PE field is set. */
+                         | (uint32_t)(kPORT_PullUp));
+
+      #define SOPT5_UART0TXSRC_UART_TX 0x00u /*!<@brief UART 0 transmit data source select: UART0_TX pin */
+
+      SIM->SOPT5 = ((SIM->SOPT5 &
+                     /* Mask bits to zero which are setting */
+                     (~(SIM_SOPT5_UART0TXSRC_MASK)))
+                    /* UART 0 transmit data source select: UART0_TX pin. */
+                    | SIM_SOPT5_UART0TXSRC(SOPT5_UART0TXSRC_UART_TX));
+      break;
+
+    case McuShellUart_CONFIG_UART_K22FN512_UART1_E1_E0:
+      CLOCK_EnableClock(kCLOCK_PortE);
+
+      /* PORTE0 (pin 1) is configured as UART1_TX */
+      PORT_SetPinMux(PORTE, 0U, kPORT_MuxAlt3);
+      PORTE->PCR[0] = ((PORTE->PCR[0] &
+                         /* Mask bits to zero which are setting */
+                         (~(PORT_PCR_PS_MASK | PORT_PCR_PE_MASK | PORT_PCR_ISF_MASK)))
+                        /* Pull Select: Internal pullup resistor is enabled on the corresponding pin, if the
+                         * corresponding PE field is set. */
+                        | (uint32_t)(kPORT_PullUp));
+
+      /* PORTE1 (pin 2) is configured as UART1_RX */
+      PORT_SetPinMux(PORTE, 1U, kPORT_MuxAlt3);
+      PORTE->PCR[1] = ((PORTE->PCR[1] &
+                         /* Mask bits to zero which are setting */
+                         (~(PORT_PCR_PS_MASK | PORT_PCR_PE_MASK | PORT_PCR_ISF_MASK)))
+                        /* Pull Select: Internal pullup resistor is enabled on the corresponding pin, if the
+                         * corresponding PE field is set. */
+                        | (uint32_t)(kPORT_PullUp));
+
+       #define SOPT5_UART1TXSRC_UART_TX 0x00u /*!<@brief UART 1 transmit data source select: UART1_TX pin */
+       SIM->SOPT5 = ((SIM->SOPT5 &
+                      /* Mask bits to zero which are setting */
+                      (~(SIM_SOPT5_UART1TXSRC_MASK | SIM_SOPT5_UART1TXSRC_MASK)))
+                     /* UART 1 transmit data source select: UART1_TX pin. */
+                     | SIM_SOPT5_UART1TXSRC(SOPT5_UART1TXSRC_UART_TX));
+      break;
+
+    case McuShellUart_CONFIG_UART_K22FN512_UART2_D2_D3:
+      CLOCK_EnableClock(kCLOCK_PortD);
+      /* PORTD2 (pin 59) is configured as UART2_RX */
+      PORT_SetPinMux(PORTD, 2U, kPORT_MuxAlt3);
+      PORTD->PCR[2] = ((PORTD->PCR[2] &
+                         /* Mask bits to zero which are setting */
+                         (~(PORT_PCR_PS_MASK | PORT_PCR_PE_MASK | PORT_PCR_ISF_MASK)))
+                        /* Pull Select: Internal pullup resistor is enabled on the corresponding pin, if the
+                         * corresponding PE field is set. */
+                        | (uint32_t)(kPORT_PullUp));
+
+      /* PORTD3 (pin 60) is configured as UART2_TX */
+      PORT_SetPinMux(PORTD, 3U, kPORT_MuxAlt3);
+      PORTD->PCR[3] = ((PORTD->PCR[3] &
+                         /* Mask bits to zero which are setting */
+                         (~(PORT_PCR_PS_MASK | PORT_PCR_PE_MASK | PORT_PCR_ISF_MASK)))
+                        /* Pull Select: Internal pullup resistor is enabled on the corresponding pin, if the
+                         * corresponding PE field is set. */
+                        | (uint32_t)(kPORT_PullUp));
+      break;
+#elif McuLib_CONFIG_CPU_VARIANT==McuLib_CONFIG_CPU_VARIANT_NXP_K22FX
+
+    #define SOPT5_UART0TXSRC_UART_TX 0x00u /*!<@brief UART 0 transmit data source select: UART0_TX pin */
+    #define SOPT5_UART1TXSRC_UART_TX 0x00u /*!<@brief UART 1 transmit data source select: UART1_TX pin */
+
+    case McuShellUart_CONFIG_UART_K22FX512_UART0_A1_A2:
+      CLOCK_EnableClock(kCLOCK_PortA);
+      /* PORTA1 (pin 27) is configured as UART0_RX */
+      PORT_SetPinMux(PORTA, 1U, kPORT_MuxAlt2);
+      PORTE->PCR[1] = ((PORTA->PCR[1] &
+                        /* Mask bits to zero which are setting */
+                        (~(PORT_PCR_PS_MASK | PORT_PCR_PE_MASK | PORT_PCR_ISF_MASK)))
+
+                       /* Pull Select: Internal pullup resistor is enabled on the corresponding pin, if the
+                        * corresponding Port Pull Enable field is set. */
+                       | (uint32_t)(kPORT_PullUp));
+
+      /* PORTA2 (pin 28) is configured as UART0_TX */
+      PORT_SetPinMux(PORTA, 2U, kPORT_MuxAlt2);
+      PORTE->PCR[2] = ((PORTA->PCR[2] &
+                        /* Mask bits to zero which are setting */
+                        (~(PORT_PCR_PS_MASK | PORT_PCR_PE_MASK | PORT_PCR_ISF_MASK)))
+
+                       /* Pull Select: Internal pullup resistor is enabled on the corresponding pin, if the
+                        * corresponding Port Pull Enable field is set. */
+                       | (uint32_t)(kPORT_PullUp));
+
+      SIM->SOPT5 = ((SIM->SOPT5 &
+                     /* Mask bits to zero which are setting */
+                     (~(SIM_SOPT5_UART0TXSRC_MASK | SIM_SOPT5_UART1TXSRC_MASK)))
+                    /* UART 0 transmit data source select: UART0_TX pin. */
+                    | SIM_SOPT5_UART0TXSRC(SOPT5_UART0TXSRC_UART_TX));
+      break;
+
+    case McuShellUart_CONFIG_UART_K22FX512_UART1_E1_E0:
+      CLOCK_EnableClock(kCLOCK_PortE);
+      /* PORTE0 (pin 1) is configured as UART1_TX */
+      PORT_SetPinMux(PORTE, 0U, kPORT_MuxAlt3);
+      PORTE->PCR[0] = ((PORTE->PCR[0] &
+                        /* Mask bits to zero which are setting */
+                        (~(PORT_PCR_PS_MASK | PORT_PCR_PE_MASK | PORT_PCR_ISF_MASK)))
+
+                       /* Pull Select: Internal pullup resistor is enabled on the corresponding pin, if the
+                        * corresponding Port Pull Enable field is set. */
+                       | (uint32_t)(kPORT_PullUp));
+
+      /* PORTE1 (pin 2) is configured as UART1_RX */
+      PORT_SetPinMux(PORTE, 1U, kPORT_MuxAlt3);
+      PORTE->PCR[1] = ((PORTE->PCR[1] &
+                        /* Mask bits to zero which are setting */
+                        (~(PORT_PCR_PS_MASK | PORT_PCR_PE_MASK | PORT_PCR_ISF_MASK)))
+
+                       /* Pull Select: Internal pullup resistor is enabled on the corresponding pin, if the
+                        * corresponding Port Pull Enable field is set. */
+                       | (uint32_t)(kPORT_PullUp));
+      SIM->SOPT5 = ((SIM->SOPT5 &
+                     /* Mask bits to zero which are setting */
+                     (~(SIM_SOPT5_UART0TXSRC_MASK | SIM_SOPT5_UART1TXSRC_MASK)))
+                    /* UART 1 transmit data source select: UART1_TX pin. */
+                    | SIM_SOPT5_UART1TXSRC(SOPT5_UART1TXSRC_UART_TX));
+      break;
+#elif McuShellUart_CONFIG_UART==McuShellUart_CONFIG_UART_K64FN1M_UART0_B16_B17
+    case McuShellUart_CONFIG_UART_K64FN1M_UART0_B16_B17:
+      /* UART0 Rx and Tx */
+      /* PORTB16 (pin 62) is configured as UART0_RX */
+      PORT_SetPinMux(PORTB, 16U, kPORT_MuxAlt3);
+
+      #define SOPT5_UART0TXSRC_UART_TX 0x00u /*!<@brief UART 0 transmit data source select: UART0_TX pin */
+
+      /* PORTB17 (pin 63) is configured as UART0_TX */
+      PORT_SetPinMux(PORTB, 1U, kPORT_MuxAlt3);
+      SIM->SOPT5 = ((SIM->SOPT5 &
+                     /* Mask bits to zero which are setting */
+                     (~(SIM_SOPT5_UART0TXSRC_MASK)))
+
+                    /* UART 0 transmit data source select: UART0_TX pin. */
+                    | SIM_SOPT5_UART0TXSRC(SOPT5_UART0TXSRC_UART_TX));
+      break;
+#elif McuLib_CONFIG_CPU_IS_RPxxxx
+    case McuShellUart_CONFIG_UART_RP2040_UART1_GPIO4_GPIO5:
+      gpio_set_function(McuShellUart_CONFIG_UART_TX_PIN, GPIO_FUNC_UART);
+      gpio_set_function(McuShellUart_CONFIG_UART_RX_PIN, GPIO_FUNC_UART);
+      break;
+#elif McuLib_CONFIG_CPU_IS_MCXN
+    case McuShellUart_CONFIG_UART_MCXN947_FC4_P1_8_P1_9:
+        /* Enables the clock for PORT1: Enables clock */
+        CLOCK_EnableClock(kCLOCK_Port1);
+
+        /* EFT detect interrupts configuration on PORT1_ */
+        PORT_DisableEFTDetectInterrupts(PORT1, 0x0300u);
+
+        const port_pin_config_t port1_8_pinA1_config = {/* Internal pull-up/down resistor is disabled */
+                                                        .pullSelect = kPORT_PullDisable,
+                                                        /* Low internal pull resistor value is selected. */
+                                                        .pullValueSelect = kPORT_LowPullResistor,
+                                                        /* Fast slew rate is configured */
+                                                        .slewRate = kPORT_FastSlewRate,
+                                                        /* Passive input filter is disabled */
+                                                        .passiveFilterEnable = kPORT_PassiveFilterDisable,
+                                                        /* Open drain output is disabled */
+                                                        .openDrainEnable = kPORT_OpenDrainDisable,
+                                                        /* Low drive strength is configured */
+                                                        .driveStrength = kPORT_LowDriveStrength,
+                                                        /* Pin is configured as FC4_P0 */
+                                                        .mux = kPORT_MuxAlt2,
+                                                        /* Digital input enabled */
+                                                        .inputBuffer = kPORT_InputBufferEnable,
+                                                        /* Digital input is not inverted */
+                                                        .invertInput = kPORT_InputNormal,
+                                                        /* Pin Control Register fields [15:0] are not locked */
+                                                        .lockRegister = kPORT_UnlockRegister};
+        /* PORT1_8 (pin A1) is configured as FC4_P0 */
+        PORT_SetPinConfig(PORT1, 8U, &port1_8_pinA1_config);
+
+        const port_pin_config_t port1_9_pinB1_config = {/* Internal pull-up/down resistor is disabled */
+                                                        .pullSelect = kPORT_PullDisable,
+                                                        /* Low internal pull resistor value is selected. */
+                                                        .pullValueSelect = kPORT_LowPullResistor,
+                                                        /* Fast slew rate is configured */
+                                                        .slewRate = kPORT_FastSlewRate,
+                                                        /* Passive input filter is disabled */
+                                                        .passiveFilterEnable = kPORT_PassiveFilterDisable,
+                                                        /* Open drain output is disabled */
+                                                        .openDrainEnable = kPORT_OpenDrainDisable,
+                                                        /* Low drive strength is configured */
+                                                        .driveStrength = kPORT_LowDriveStrength,
+                                                        /* Pin is configured as FC4_P1 */
+                                                        .mux = kPORT_MuxAlt2,
+                                                        /* Digital input enabled */
+                                                        .inputBuffer = kPORT_InputBufferEnable,
+                                                        /* Digital input is not inverted */
+                                                        .invertInput = kPORT_InputNormal,
+                                                        /* Pin Control Register fields [15:0] are not locked */
+                                                        .lockRegister = kPORT_UnlockRegister};
+        /* PORT1_9 (pin B1) is configured as FC4_P1 */
+        PORT_SetPinConfig(PORT1, 9U, &port1_9_pinB1_config);
+        break;
+#endif /* McuLib_CONFIG_CPU_VARIANT_NXP_K22FN */
+    default:
+      McuLog_fatal("Unknown UART configuration!");
+      for(;;) { /* error */ }
+  } /* switch */
+}
+
+#if McuShellUart_CONFIG_DO_PIN_MUXING
+static void InitUartMuxing(void) {
+#if McuShellUart_CONFIG_UART==McuShellUart_CONFIG_UART_LPC845_USART0
+  /* Enables clock for switch matrix.: enable */
+  CLOCK_EnableClock(kCLOCK_Swm);
+  /* USART0_TXD connect to P0_25 */
+  SWM_SetMovablePinSelect(SWM0, kSWM_USART0_TXD, kSWM_PortPin_P0_25);
+  /* USART0_RXD connect to P0_24 */
+  SWM_SetMovablePinSelect(SWM0, kSWM_USART0_RXD, kSWM_PortPin_P0_24);
+  /* Disable clock for switch matrix. */
+  CLOCK_DisableClock(kCLOCK_Swm);
+#elif McuShellUart_CONFIG_UART==McuShellUart_CONFIG_UART_K22FX512_UART0_A1_A2
+  McuShellUart_MuxUartPins(McuShellUart_CONFIG_UART_K22FX512_UART0_A1_A2);
+#elif McuShellUart_CONFIG_UART==McuShellUart_CONFIG_UART_K22FX512_UART1_E1_E0
+  McuShellUart_MuxUartPins(McuShellUart_CONFIG_UART_K22FX512_UART1_E1_E0);
+#elif McuShellUart_CONFIG_UART==McuShellUart_CONFIG_UART_K22FN512_LPUART0_C3_C4
+  McuShellUart_MuxUartPins(McuShellUart_CONFIG_UART_K22FN512_LPUART0_C3_C4);
+#elif McuShellUart_CONFIG_UART==McuShellUart_CONFIG_UART_K22FN512_UART0_A1_A2
+  McuShellUart_MuxUartPins(McuShellUart_CONFIG_UART_K22FN512_UART0_A1_A2);
+#elif McuShellUart_CONFIG_UART==McuShellUart_CONFIG_UART_K22FN512_UART0_B16_B17
+  McuShellUart_MuxUartPins(McuShellUart_CONFIG_UART_K22FN512_UART0_B16_B17);
+#elif McuShellUart_CONFIG_UART==McuShellUart_CONFIG_UART_K22FN512_UART1_E1_E0
+  McuShellUart_MuxUartPins(McuShellUart_CONFIG_UART_K22FN512_UART1_E1_E0);
+#elif McuShellUart_CONFIG_UART==McuShellUart_CONFIG_UART_K22FN512_UART2_D2_D3
+  McuShellUart_MuxUartPins(McuShellUart_CONFIG_UART_K22FN512_UART2_D2_D3);
+#elif McuShellUart_CONFIG_UART==McuShellUart_CONFIG_UART_K64FN1M_UART0_B16_B17
+  McuShellUart_MuxUartPins(McuShellUart_CONFIG_UART_K64FN1M_UART0_B16_B17);
+#elif McuShellUart_CONFIG_UART==McuShellUart_CONFIG_UART_LPC55S16_USART0
+  #define IOCON_PIO_FUNC1 0x01u
+  #define IOCON_PIO_INV_DI 0x00u
+  #define IOCON_PIO_MODE_INACT 0x00u
+  #define IOCON_PIO_SLEW_STANDARD 0x00u
+  #define IOCON_PIO_OPENDRAIN_DI 0x00u
+  #define IOCON_PIO_DIGITAL_EN 0x0100u
+  #define PIO0_3_FUNC_ALT1 0x01u
+  #define PIO0_3_DIGIMODE_DIGITAL 0x01u
+
+  const uint32_t port0_pin29_config = (/* Pin is configured as FC0_RXD_SDA_MOSI_DATA */
+                                       IOCON_PIO_FUNC1 |
+                                       /* No addition pin function */
+                                       IOCON_PIO_MODE_INACT |
+                                       /* Standard mode, output slew rate control is enabled */
+                                       IOCON_PIO_SLEW_STANDARD |
+                                       /* Input function is not inverted */
+                                       IOCON_PIO_INV_DI |
+                                       /* Enables digital function */
+                                       IOCON_PIO_DIGITAL_EN |
+                                       /* Open drain is disabled */
+                                       IOCON_PIO_OPENDRAIN_DI);
+  /* PORT0 PIN29 (coords: 92) is configured as FC0_RXD_SDA_MOSI_DATA */
+  IOCON_PinMuxSet(IOCON, 0U, 29U, port0_pin29_config);
+
+  IOCON->PIO[0][3] = ((IOCON->PIO[0][3] &
+                       /* Mask bits to zero which are setting */
+                       (~(IOCON_PIO_FUNC_MASK | IOCON_PIO_DIGIMODE_MASK)))
+
+                      /* Selects pin function.
+                       * : PORT03 (pin 83) is configured as FC3_RXD_SDA_MOSI_DATA. */
+                      | IOCON_PIO_FUNC(PIO0_3_FUNC_ALT1)
+
+                      /* Select Digital mode.
+                       * : Enable Digital mode.
+                       * Digital input is enabled. */
+                      | IOCON_PIO_DIGIMODE(PIO0_3_DIGIMODE_DIGITAL));
+
+  const uint32_t port0_pin30_config = (/* Pin is configured as FC0_TXD_SCL_MISO_WS */
+                                       IOCON_PIO_FUNC1 |
+                                       /* No addition pin function */
+                                       IOCON_PIO_MODE_INACT |
+                                       /* Standard mode, output slew rate control is enabled */
+                                       IOCON_PIO_SLEW_STANDARD |
+                                       /* Input function is not inverted */
+                                       IOCON_PIO_INV_DI |
+                                       /* Enables digital function */
+                                       IOCON_PIO_DIGITAL_EN |
+                                       /* Open drain is disabled */
+                                       IOCON_PIO_OPENDRAIN_DI);
+  /* PORT0 PIN30 (coords: 94) is configured as FC0_TXD_SCL_MISO_WS */
+  IOCON_PinMuxSet(IOCON, 0U, 30U, port0_pin30_config);
+#elif McuShellUart_CONFIG_UART==McuShellUart_CONFIG_UART_LPC55S16_USART2
+  #define PIO0_27_FUNC_ALT1 0x01u
+  #define PIO1_24_FUNC_ALT1 0x01u
+  #define PIO0_27_DIGIMODE_DIGITAL 0x01u
+  #define PIO1_24_DIGIMODE_DIGITAL 0x01u
+
+  IOCON->PIO[0][27] = ((IOCON->PIO[0][27] &
+                        /* Mask bits to zero which are setting */
+                        (~(IOCON_PIO_FUNC_MASK | IOCON_PIO_DIGIMODE_MASK)))
+
+                       /* Selects pin function.
+                        * : PORT027 (pin 27) is configured as FC2_TXD_SCL_MISO_WS. */
+                       | IOCON_PIO_FUNC(PIO0_27_FUNC_ALT1)
+
+                       /* Select Digital mode.
+                        * : Enable Digital mode.
+                        * Digital input is enabled. */
+                       | IOCON_PIO_DIGIMODE(PIO0_27_DIGIMODE_DIGITAL));
+
+  IOCON->PIO[1][24] = ((IOCON->PIO[1][24] &
+                        /* Mask bits to zero which are setting */
+                        (~(IOCON_PIO_FUNC_MASK | IOCON_PIO_DIGIMODE_MASK)))
+
+                       /* Selects pin function.
+                        * : PORT124 (pin 3) is configured as FC2_RXD_SDA_MOSI_DATA. */
+                       | IOCON_PIO_FUNC(PIO1_24_FUNC_ALT1)
+
+                       /* Select Digital mode.
+                        * : Enable Digital mode.
+                        * Digital input is enabled. */
+                       | IOCON_PIO_DIGIMODE(PIO1_24_DIGIMODE_DIGITAL));
+#elif McuShellUart_CONFIG_UART==McuShellUart_CONFIG_UART_LPC55S69_USART0
+  #define IOCON_PIO_DIGITAL_EN 0x0100u  /*!<@brief Enables digital function */
+  #define IOCON_PIO_FUNC1 0x01u         /*!<@brief Selects pin function 1 */
+  #define IOCON_PIO_FUNC10 0x0Au        /*!<@brief Selects pin function 10 */
+  #define IOCON_PIO_INV_DI 0x00u        /*!<@brief Input function is not inverted */
+  #define IOCON_PIO_MODE_INACT 0x00u    /*!<@brief No addition pin function */
+  #define IOCON_PIO_OPENDRAIN_DI 0x00u  /*!<@brief Open drain is disabled */
+  #define IOCON_PIO_SLEW_STANDARD 0x00u /*!<@brief Standard mode, output slew rate control is enabled */
+
+  CLOCK_EnableClock(kCLOCK_Iocon);
+  const uint32_t port0_pin29_config = (/* Pin is configured as FC0_RXD_SDA_MOSI_DATA */
+      IOCON_PIO_FUNC1 |
+      /* No addition pin function */
+      IOCON_PIO_MODE_INACT |
+      /* Standard mode, output slew rate control is enabled */
+      IOCON_PIO_SLEW_STANDARD |
+      /* Input function is not inverted */
+      IOCON_PIO_INV_DI |
+      /* Enables digital function */
+      IOCON_PIO_DIGITAL_EN |
+      /* Open drain is disabled */
+      IOCON_PIO_OPENDRAIN_DI);
+  /* PORT0 PIN29 (coords: 92) is configured as FC0_RXD_SDA_MOSI_DATA */
+  IOCON_PinMuxSet(IOCON, 0U, 29U, port0_pin29_config);
+
+  const uint32_t port0_pin30_config = (/* Pin is configured as FC0_TXD_SCL_MISO_WS */
+      IOCON_PIO_FUNC1 |
+      /* No addition pin function */
+      IOCON_PIO_MODE_INACT |
+      /* Standard mode, output slew rate control is enabled */
+      IOCON_PIO_SLEW_STANDARD |
+      /* Input function is not inverted */
+      IOCON_PIO_INV_DI |
+      /* Enables digital function */
+      IOCON_PIO_DIGITAL_EN |
+      /* Open drain is disabled */
+      IOCON_PIO_OPENDRAIN_DI);
+  /* PORT0 PIN30 (coords: 94) is configured as FC0_TXD_SCL_MISO_WS */
+  IOCON_PinMuxSet(IOCON, 0U, 30U, port0_pin30_config);
+#elif McuShellUart_CONFIG_UART==McuShellUart_CONFIG_UART_LPC55S69_USART1
+  #define PIO1_10_DIGIMODE_DIGITAL 0x01u
+  #define PIO1_10_FUNC_ALT2 0x02u
+  #define PIO1_11_FUNC_ALT2 0x02u
+  #define PIO1_11_DIGIMODE_DIGITAL 0x01u
+
+  CLOCK_EnableClock(kCLOCK_Iocon);
+  IOCON->PIO[1][10] = ((IOCON->PIO[1][10] &
+    /* Mask bits to zero which are setting */
+    (~(IOCON_PIO_FUNC_MASK | IOCON_PIO_DIGIMODE_MASK)))
+
+  /* Selects pin function.
+    * : PORT110 (pin 40) is configured as FC1_RXD_SDA_MOSI_DATA. */
+  | IOCON_PIO_FUNC(PIO1_10_FUNC_ALT2)
+
+  /* Select Digital mode.
+    * : Enable Digital mode.
+    * Digital input is enabled. */
+  | IOCON_PIO_DIGIMODE(PIO1_10_DIGIMODE_DIGITAL));
+
+  IOCON->PIO[1][11] = ((IOCON->PIO[1][11] &
+    /* Mask bits to zero which are setting */
+    (~(IOCON_PIO_FUNC_MASK | IOCON_PIO_DIGIMODE_MASK)))
+
+  /* Selects pin function.
+    * : PORT111 (pin 93) is configured as FC1_TXD_SCL_MISO_WS. */
+  | IOCON_PIO_FUNC(PIO1_11_FUNC_ALT2)
+
+  /* Select Digital mode.
+    * : Enable Digital mode.
+    * Digital input is enabled. */
+  | IOCON_PIO_DIGIMODE(PIO1_11_DIGIMODE_DIGITAL));
+#elif McuShellUart_CONFIG_UART==McuShellUart_CONFIG_UART_MCXN947_FC4_P1_8_P1_9
+  CLOCK_EnableClock(kCLOCK_Port1);
+
+  const port_pin_config_t port1_8_pinA1_config = {/* Internal pull-up/down resistor is disabled */
+                                                  kPORT_PullDisable,
+                                                  /* Low internal pull resistor value is selected. */
+                                                  kPORT_LowPullResistor,
+                                                  /* Fast slew rate is configured */
+                                                  kPORT_FastSlewRate,
+                                                  /* Passive input filter is disabled */
+                                                  kPORT_PassiveFilterDisable,
+                                                  /* Open drain output is disabled */
+                                                  kPORT_OpenDrainDisable,
+                                                  /* Low drive strength is configured */
+                                                  kPORT_LowDriveStrength,
+                                                  /* Pin is configured as FC4_P0 */
+                                                  kPORT_MuxAlt2,
+                                                  /* Digital input enabled */
+                                                  kPORT_InputBufferEnable,
+                                                  /* Digital input is not inverted */
+                                                  kPORT_InputNormal,
+                                                  /* Pin Control Register fields [15:0] are not locked */
+                                                  kPORT_UnlockRegister};
+  /* PORT1_8 (pin A1) is configured as FC4_P0 */
+  PORT_SetPinConfig(PORT1, 8U, &port1_8_pinA1_config);
+
+  const port_pin_config_t port1_9_pinB1_config = {/* Internal pull-up/down resistor is disabled */
+                                                  kPORT_PullDisable,
+                                                  /* Low internal pull resistor value is selected. */
+                                                  kPORT_LowPullResistor,
+                                                  /* Fast slew rate is configured */
+                                                  kPORT_FastSlewRate,
+                                                  /* Passive input filter is disabled */
+                                                  kPORT_PassiveFilterDisable,
+                                                  /* Open drain output is disabled */
+                                                  kPORT_OpenDrainDisable,
+                                                  /* Low drive strength is configured */
+                                                  kPORT_LowDriveStrength,
+                                                  /* Pin is configured as FC4_P1 */
+                                                  kPORT_MuxAlt2,
+                                                  /* Digital input enabled */
+                                                  kPORT_InputBufferEnable,
+                                                  /* Digital input is not inverted */
+                                                  kPORT_InputNormal,
+                                                  /* Pin Control Register fields [15:0] are not locked */
+                                                  kPORT_UnlockRegister};
+  /* PORT1_9 (pin B1) is configured as FC4_P1 */
+  PORT_SetPinConfig(PORT1, 9U, &port1_9_pinB1_config);
+#endif
+}
+#endif /* McuShellUart_CONFIG_DO_PIN_MUXING */
+
+#if McuLib_CONFIG_CPU_IS_ESP32
+static void IniEspUart(void) {
+  uart_config_t uart_config = {
+      .baud_rate = McuShellUart_CONFIG_UART_BAUDRATE,
+      .data_bits = McuShellUart_CONFIG_DATA_BITS,
+      .parity = UART_PARITY_DISABLE,
+      .stop_bits = McuShellUart_CONFIG_STOP_BITS,
+      .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+      .rx_flow_ctrl_thresh = 0,
+  };
+
+  /* Configure UART parameters */
+  uart_param_config(McuShellUart_CONFIG_UART_DEVICE, &uart_config);
+  uart_set_pin(McuShellUart_CONFIG_UART_DEVICE, McuShellUart_CONFIG_UART_TX_PIN, McuShellUart_CONFIG_UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+
+  /* Install UART driver (we don't need an event queue here) */
+  uart_driver_install(McuShellUart_CONFIG_UART_DEVICE, McuShellUart_CONFIG_ESP_UART_RX_BUF_SIZE, McuShellUart_CONFIG_ESP_UART_TX_BUF_SIZE, 0, NULL, 0);
+  uart_set_mode(McuShellUart_CONFIG_UART_DEVICE, UART_MODE_UART);
+}
+#endif/* McuLib_CONFIG_CPU_IS_ESP32 */
+
+static void InitUart(void) {
+#if McuLib_CONFIG_CPU_IS_RPxxxx
+  /* nothing needed */
+#elif McuLib_CONFIG_CPU_IS_ESP32
+  IniEspUart();
+#else
+  McuShellUart_CONFIG_UART_CONFIG_STRUCT config;
+  status_t status;
+
+#if McuShellUart_CONFIG_DO_CONFIGURE_CLOCKS
+  McuShellUart_CONFIG_CLOCKING_CONFIG();
+#endif
+#if McuShellUart_CONFIG_DO_PIN_MUXING
+  InitUartMuxing();
+#endif
+  McuShellUart_CONFIG_UART_SET_UART_CLOCK();
+  McuShellUart_CONFIG_UART_GET_DEFAULT_CONFIG(&config);
+  config.baudRate_Bps = McuShellUart_CONFIG_UART_BAUDRATE;
+  config.enableRx     = true;
+  config.enableTx     = true;
+
+  /* Initialize the USART with configuration. */
+  status = McuShellUart_CONFIG_UART_INIT(McuShellUart_CONFIG_UART_DEVICE, &config, CLOCK_GetFreq(McuShellUart_CONFIG_UART_GET_CLOCK_FREQ_SELECT));
+  if (status!=kStatus_Success) {
+    McuLog_error("failed initializing UART");
+    for(;;) {/* error */}
+  }
+  McuShellUart_CONFIG_UART_ENABLE_INTERRUPTS(McuShellUart_CONFIG_UART_DEVICE, McuShellUart_CONFIG_UART_ENABLE_INTERRUPT_FLAGS);
+#if McuShellUart_CONFIG_USE_FREERTOS
+  NVIC_SetPriority(McuShellUart_CONFIG_UART_IRQ_NUMBER, configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY);
+#endif
+  EnableIRQ(McuShellUart_CONFIG_UART_IRQ_NUMBER);
+#endif
+}
+
+#if McuLib_CONFIG_CPU_IS_ESP32
+static unsigned char McuShellUart_ESP_ReadByte(uart_port_t uart_num) {
+  unsigned char ch;
+  int len =  uart_read_bytes(uart_num, &ch, 1, 0);
+  if (len==0) {
+    ch = '\0';
+  } else {
+    ch = ch;
+  }
+  return ch;
+}
+#endif
+
+int McuShellUart_WriteBytes(const void *data, size_t size) {
+#if McuLib_CONFIG_CPU_IS_ESP32
+  int written = uart_write_bytes(McuShellUart_CONFIG_UART_DEVICE, data, size);
+  return written;
+#else
+  /* other APIs do not return the number of characters written */
+  McuShellUart_CONFIG_UART_WRITE_BLOCKING(McuShellUart_CONFIG_UART_DEVICE, data, size);
+  return size;
+#endif
+}
+
+int McuShellUart_WriteString(const char *str) {
+  size_t len = McuUtility_strlen(str);
+#if McuLib_CONFIG_CPU_IS_ESP32
+  int written = uart_write_bytes(McuShellUart_CONFIG_UART_DEVICE, (const char*)str, len);
+  return written;
+#else
+  /* other APIs do not return the number of characters written */
+  McuShellUart_CONFIG_UART_WRITE_BLOCKING(McuShellUart_CONFIG_UART_DEVICE, (const uint8_t*)str, len);
+  return len;
+#endif
+}
+
+int McuShellUart_PollChar(void) {
+  uint8_t ch = McuShellUart_CONFIG_UART_READ_BYTE(McuShellUart_CONFIG_UART_DEVICE);
+  return ch;
+}
+
+void McuShellUart_Deinit(void) {
+#if McuShellUart_CONFIG_USE_FREERTOS
+  vQueueDelete(uartRxQueue);
+  uartRxQueue = NULL;
+#else
+  McuRB_DeinitRB(rxRingBuffer);
+  rxRingBuffer = NULL;
+#endif
+}
+
+void McuShellUart_Init(void) {
+#if McuShellUart_CONFIG_USE_FREERTOS
+  uartRxQueue = xQueueCreate(McuShellUart_CONFIG_UART_RX_QUEUE_LENGTH, sizeof(uint8_t));
+  if (uartRxQueue==NULL) {
+    for(;;){} /* out of memory? */
+  }
+  vQueueAddToRegistry(uartRxQueue, "UartRxQueue");
+#else
+  McuRB_Config_t config;
+
+  McuRB_GetDefaultconfig(&config);
+  config.elementSize = sizeof(uint8_t);
+  config.nofElements = McuShellUart_CONFIG_UART_RX_QUEUE_LENGTH;
+  rxRingBuffer = McuRB_InitRB(&config);
+  if (rxRingBuffer==NULL) {
+    for(;;) {/* error */}
+  }
+#endif
+  InitUart();
+}
+
+#endif /* McuShellUart_CONFIG_IS_ENABLED && McuShellUart_CONFIG_UART!=McuShellUart_CONFIG_UART_NONE*/
