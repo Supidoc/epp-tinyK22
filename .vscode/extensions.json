@@ -1,0 +1,13 @@
+{
+    "recommendations": [
+        "mcu-debug.debug-tracker-vscode",
+        "marus25.cortex-debug",
+        "nxpsemiconductors.mcuxpresso",
+        "ms-vscode.cpptools",
+        "ms-vscode.cmake-tools",
+        "ms-vscode.vscode-serial-monitor",
+        "ms-vscode.cpptools-extension-pack",
+        "ms-azuretools.vscode-docker",
+        "jacqueslucke.gcov-viewer"
+    ]
+}

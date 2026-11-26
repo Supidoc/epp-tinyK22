@@ -1,0 +1,86 @@
+{
+  "configurations": [
+    {
+      "type": "mcuxpresso-debug",
+      "name": "MCUXpresso Debug",
+      "request": "launch",
+      "cwd": "${workspaceFolder}",
+      "stopAtSymbol": "main",
+      "isAttach": false,
+      "skipBuildBeforeDebug": false,
+      "gdbInitCommands": [
+        "set remotetimeout 600",
+        "set debug-file-directory",
+        "set non-stop off"
+      ],
+      "gdbServerConfigs": {
+        "linkserver": {
+          "device": "MK22FN512xxx12:FRDM-K22F"
+        },
+        "segger": {
+          "rtos": "GDBServer/RTOSPlugin_FreeRTOS",
+          "gdbServerCwd": "${workspaceFolder}",
+          "device": "MK22FN512xxx12"
+        },
+        "pemicro": {}
+      },
+      "showDevDebugOutput": "none",
+      "probeType": "SEGGER",
+      "probeSerialNumber": "621000000"
+    },
+    {
+      "name": "J-Link cortex-debug with Host GDB Server",
+      "type": "cortex-debug",
+      "request": "launch",
+      "servertype": "external",
+      "cwd": "${workspaceFolder}",
+      "executable": "${command:cmake.launchTargetPath}",
+      "gdbTarget": "host.docker.internal:2331", // launch on host with: JLinkGDBServerCLExe -select USB -device MK22FN512xxx12 -endian little -if SWD -rtos GDBServer/RTOSPlugin_FreeRTOS
+      "device": "MK22FN512xxx12",
+      "runToEntryPoint": "main", // "_reset_handler" or for example "main"
+      "postLaunchCommands":[
+          "monitor reset",
+          "monitor semihosting enable",
+          "monitor semihosting ioclient 1", // 1: telnet (localhost, port 50002); 2: gdb; 3: both telnet and gdbclient output
+      ],
+      "svdFile": "${env:MCUXPRESSO_SDK_PATH}/devices/MK22F51212/MK22F51212.xml",
+      "loadFiles": [
+        "${command:cmake.launchTargetPath}"
+      ],
+    },
+    {
+      "name": "J-Link cortex-debug",
+      "type": "cortex-debug",
+      "request": "launch",
+      "servertype": "jlink",
+      "serverpath": "${env:SEGGER_GDB_SERVER}", // or set in global json: cortex-debug.JLinkGDBServerPath
+      "cwd": "${workspaceFolder}",
+      "executable": "${command:cmake.launchTargetPath}",
+      "armToolchainPath": "${env:TOOLCHAIN_PATH}/bin",  // needed for gdb
+      "device": "MK22FN512xxx12",
+      "interface": "swd",
+      "serialNumber": "", // add J-Link serial number if having multiple attached the same time.
+      "runToEntryPoint": "main", // "ResetISR"
+      "postLaunchCommands": [
+          "monitor reset",
+          "monitor semihosting enable",
+          "monitor semihosting ioclient 1", // 1: telnet (port 2333); 2: gdb; 3: both telnet and gdbclient output
+      ],
+      "postRestartCommands": [],
+      "postResetCommands": [],
+      "rtos": "FreeRTOS",
+      "svdFile": "${env:MCUXPRESSO_SDK_PATH}/devices/MK22F51212/MK22F51212.xml",
+      "rttConfig": {
+          "enabled": false,
+          "address": "auto",
+          "decoders": [
+              {
+                  "label": "",
+                  "port": 0,
+                  "type": "console"
+              }
+          ]
+      } 
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "version": "25.6",
+  "toolchainPath": "${env:TOOLCHAIN_PATH}",
+  "linkedProjects": [],
+  "trustZoneType": "none",
+  "multicoreType": "none",
+  "projectType": "sdk-freestanding",
+  "projectName": "epp-tinyk22",
+  "sdk": {
+    "version": "25.06.00",
+    "path": "${env:MCUXPRESSO_SDK_PATH}",
+    "boardId": "frdmk22f",
+    "deviceId": "MK22FN512xxx12",
+    "coreId": "core0_MK22FN512xxx12",
+    "partId": "MK22FN512VLL12"
+  }
+}
