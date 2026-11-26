@@ -4,7 +4,7 @@ set -euo pipefail
 project_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 linkserver="${LINKSERVER:-LinkServer}"
 device="${LINKSERVER_DEVICE:-MK22FN512xxx12}"
-image="${1:-${project_root}/build/debug/epp-tinyk22.s19}"
+image="${1:-${project_root}/build/debug/epp-tinyK22.s19}"
 
 if ! command -v "$linkserver" >/dev/null 2>&1; then
     printf 'LinkServer not found. Set LINKSERVER to its executable path.\n' >&2
